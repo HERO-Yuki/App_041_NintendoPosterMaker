@@ -561,8 +561,15 @@ def _parse_igdb_game(g: dict) -> dict:
 
 @st.cache_data(ttl=_CACHE_TTL, max_entries=_CACHE_MAX_SEARCH)
 def search_igdb(query: str) -> list[dict]:
-    """IGDB でゲームをキーワード検索する。対象プラットフォームは IGDB_PLATFORM_IDS で絞り込む。"""
+    """IGDB でゲームをキーワード検索する。
+    英語タイトルは通常の search エンドポイント、
+    日本語等の非 ASCII を含む場合は alternative_names も検索してマージする。
+    """
     platform_str = "(" + ",".join(str(p) for p in IGDB_PLATFORM_IDS) + ")"
+    headers = _igdb_headers()
+    results: dict[int, dict] = {}   # game_id → parsed dict（重複排除用）
+
+    # ── 1. 通常検索（英語タイトル向け full-text search）────────────────
     body = (
         "fields id, name, cover.image_id, screenshots.image_id, "
         "aggregated_rating, aggregated_rating_count; "
@@ -573,14 +580,55 @@ def search_igdb(query: str) -> list[dict]:
     try:
         resp = requests.post(
             "https://api.igdb.com/v4/games",
-            headers=_igdb_headers(),
+            headers=headers,
             data=body,
             timeout=10,
         )
         resp.raise_for_status()
-        return [_parse_igdb_game(g) for g in resp.json()]
+        for g in resp.json():
+            results[g["id"]] = _parse_igdb_game(g)
     except Exception:
-        return []
+        pass
+
+    # ── 2. 日本語など非 ASCII を含む場合 → alternative_names も検索 ────
+    if any(ord(c) > 127 for c in query):
+        alt_body = f'fields game; where name ~ *"{query}"*; limit 20;'
+        try:
+            alt_resp = requests.post(
+                "https://api.igdb.com/v4/alternative_names",
+                headers=headers,
+                data=alt_body,
+                timeout=10,
+            )
+            alt_resp.raise_for_status()
+            # まだ results に入っていないゲーム ID を収集
+            new_ids = [
+                item["game"]
+                for item in alt_resp.json()
+                if "game" in item and item["game"] not in results
+            ]
+            if new_ids:
+                ids_str = "(" + ",".join(str(i) for i in new_ids[:10]) + ")"
+                games_body = (
+                    "fields id, name, cover.image_id, screenshots.image_id, "
+                    "aggregated_rating, aggregated_rating_count; "
+                    f"where id = {ids_str} & platforms = {platform_str}; "
+                    "limit 10;"
+                )
+                games_resp = requests.post(
+                    "https://api.igdb.com/v4/games",
+                    headers=headers,
+                    data=games_body,
+                    timeout=10,
+                )
+                games_resp.raise_for_status()
+                for g in games_resp.json():
+                    if g["id"] not in results:
+                        results[g["id"]] = _parse_igdb_game(g)
+        except Exception:
+            pass
+
+    return list(results.values())
 
 
 @st.cache_data(ttl=_CACHE_TTL, max_entries=_CACHE_MAX_DETAILS)
