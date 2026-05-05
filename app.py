@@ -572,69 +572,96 @@ _GAMES_FIELDS = (
 )
 
 
-@st.cache_data(ttl=_CACHE_TTL, max_entries=_CACHE_MAX_SEARCH)
-def search_igdb(query: str) -> list[dict]:
-    """IGDB でゲームをキーワード検索する。
-    英語: full-text search。
-    日本語等の非 ASCII: alternative_names + primary name 部分一致も実施してマージ。
-    最終的に aggregated_rating_count 降順でソートし人気タイトルを上位に表示する。
+@st.cache_data(ttl=86_400 * 30)   # 30日キャッシュ（新ハード登録時に自動更新）
+def _get_switch_platform_ids() -> list[int]:
+    """IGDB から "Nintendo Switch" を名前に含むプラットフォーム ID を動的取得する。
+    Switch 2 など新ハードが IGDB に登録されると自動で含まれるようになる。
+    取得失敗時は定数 IGDB_PLATFORM_IDS にフォールバック。
     """
-    platform_str = "(" + ",".join(str(p) for p in IGDB_PLATFORM_IDS) + ")"
-    headers = _igdb_headers()
-    results: dict[int, dict] = {}   # game_id → parsed dict（重複排除用）
+    body = 'fields id, name; where name ~ *"Nintendo Switch"*; limit 10;'
+    try:
+        resp = requests.post(
+            "https://api.igdb.com/v4/platforms",
+            headers=_igdb_headers(),
+            data=body,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        ids = [p["id"] for p in resp.json() if p.get("id")]
+        return ids if ids else list(IGDB_PLATFORM_IDS)
+    except Exception:
+        return list(IGDB_PLATFORM_IDS)
 
-    # ── 1. 通常検索（英語タイトル向け full-text search）────────────────
-    body = (
-        _GAMES_FIELDS
-        + f'search "{query}"; '
-        + f"where platforms = {platform_str}; "
-        + "sort aggregated_rating_count desc; "
-        + "limit 10;"
-    )
+
+def _platform_str() -> str:
+    """現在有効な Switch 系プラットフォーム ID を Apicalypse 用文字列で返す。"""
+    ids = _get_switch_platform_ids()
+    return "(" + ",".join(str(i) for i in ids) + ")"
+
+
+def _fetch_games(headers: dict, body: str, timeout: int = 10) -> list[dict]:
+    """IGDB /games エンドポイントを叩いてパース済みリストを返す。例外は空リストに変換。"""
     try:
         resp = requests.post(
             "https://api.igdb.com/v4/games",
             headers=headers,
             data=body,
-            timeout=10,
+            timeout=timeout,
         )
         resp.raise_for_status()
-        for g in resp.json():
-            results[g["id"]] = _parse_igdb_game(g)
+        return resp.json()
     except Exception:
-        pass
+        return []
 
-    # ── 2. 日本語など非 ASCII を含む場合 ────────────────────────────────
+
+@st.cache_data(ttl=_CACHE_TTL, max_entries=_CACHE_MAX_SEARCH)
+def search_igdb(query: str) -> list[dict]:
+    """IGDB でゲームをキーワード検索する。
+
+    検索経路（最大4経路をマージ）:
+      1. full-text search（英語タイトル向け・メジャー／インディー共通）
+      2. primary name 部分一致（日本語クエリ時・日本語名がプライマリの場合）
+      3. alternative_names 部分一致（日本語クエリ時・日本語が別名登録されている場合）
+      4. 3 のヒット ID を platform フィルター付きで再クエリ
+
+    最終的に _popularity（rating_count + aggregated_rating_count + follows）降順でソート。
+    サーバー側ソートは使わず、null フィールドによる除外を防ぐ。
+    """
+    pstr    = _platform_str()
+    headers = _igdb_headers()
+    results: dict[int, dict] = {}
+
+    # ── 1. full-text search ──────────────────────────────────────────────
+    #   インディーズを含む全タイトル対象。limit 10 で候補を取得。
+    body1 = (
+        _GAMES_FIELDS
+        + f'search "{query}"; '
+        + f"where platforms = {pstr}; "
+        + "limit 10;"
+    )
+    for g in _fetch_games(headers, body1):
+        results[g["id"]] = _parse_igdb_game(g)
+
+    # ── 2・3・4. 非 ASCII（日本語等）クエリの追加経路 ───────────────────
     if any(ord(c) > 127 for c in query):
-        # 2a. primary name 部分一致（IGDB が日本語名をプライマリ登録している場合）
-        prim_body = (
-            _GAMES_FIELDS
-            + f'where name ~ *"{query}"* & platforms = {platform_str}; '
-            + "sort aggregated_rating_count desc; "
-            + "limit 10;"
-        )
-        try:
-            prim_resp = requests.post(
-                "https://api.igdb.com/v4/games",
-                headers=headers,
-                data=prim_body,
-                timeout=10,
-            )
-            prim_resp.raise_for_status()
-            for g in prim_resp.json():
-                if g["id"] not in results:
-                    results[g["id"]] = _parse_igdb_game(g)
-        except Exception:
-            pass
 
-        # 2b. alternative_names 部分一致 → game ID を取得（大量に取って後でプラットフォーム絞り込み）
-        alt_body = f'fields game; where name ~ *"{query}"*; limit 200;'
+        # 2. primary name 部分一致
+        body2 = (
+            _GAMES_FIELDS
+            + f'where name ~ *"{query}"* & platforms = {pstr}; '
+            + "limit 20;"
+        )
+        for g in _fetch_games(headers, body2):
+            if g["id"] not in results:
+                results[g["id"]] = _parse_igdb_game(g)
+
+        # 3. alternative_names 部分一致 → game ID 収集
         alt_ids: list[int] = []
         try:
             alt_resp = requests.post(
                 "https://api.igdb.com/v4/alternative_names",
                 headers=headers,
-                data=alt_body,
+                data=f'fields game; where name ~ *"{query}"*; limit 200;',
                 timeout=10,
             )
             alt_resp.raise_for_status()
@@ -647,32 +674,24 @@ def search_igdb(query: str) -> list[dict]:
         except Exception:
             pass
 
+        # 4. 収集した ID を一括クエリ（platform フィルターで Switch 以外を除外）
+        #    limit を設けず全件返させる（サーバーデフォルト上限=10 に依存しない）
         if alt_ids:
-            # 最大 50 ID を一括クエリ。platform フィルターで Switch 以外を除外するため
-            # 多めに渡して絞り込む。limit 20 で上位を取得。
             ids_str = "(" + ",".join(str(i) for i in alt_ids[:50]) + ")"
-            games_body = (
+            body4 = (
                 _GAMES_FIELDS
-                + f"where id = {ids_str} & platforms = {platform_str}; "
-                + "sort follows desc; "
-                + "limit 20;"
+                + f"where id = {ids_str} & platforms = {pstr}; "
+                + "limit 50;"
             )
-            try:
-                games_resp = requests.post(
-                    "https://api.igdb.com/v4/games",
-                    headers=headers,
-                    data=games_body,
-                    timeout=10,
-                )
-                games_resp.raise_for_status()
-                for g in games_resp.json():
-                    if g["id"] not in results:
-                        results[g["id"]] = _parse_igdb_game(g)
-            except Exception:
-                pass
+            for g in _fetch_games(headers, body4):
+                if g["id"] not in results:
+                    results[g["id"]] = _parse_igdb_game(g)
 
-    # 人気度（rating_count + aggregated_rating_count + follows の合算）降順でソート
-    # → Arcade Archives 等の無名タイトルが下位に押し下げられる
+    # ── 最終ソート（クライアント側のみ）─────────────────────────────────
+    # _popularity = rating_count + aggregated_rating_count + follows の合算。
+    # null フィールドを 0 として扱うため、サーバー側 sort は使わない。
+    # → Arcade Archives 等 follows=0 のタイトルが自然に下位へ。
+    # → follows が未登録のインディーも除外されず結果に残る。
     sorted_results = sorted(
         results.values(),
         key=lambda x: x.get("_popularity") or 0,
