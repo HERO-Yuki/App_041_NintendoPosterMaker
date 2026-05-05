@@ -555,15 +555,20 @@ def _parse_igdb_game(g: dict) -> dict:
         "cover_image_id":      cover_id,
         "screenshot_image_id": shot_id,
         "metacritic":          int(mc_raw) if mc_raw else None,
-        # ソート用（ユーザーには非表示）。評価数が多いほど人気タイトル
-        "_rating_count":       g.get("aggregated_rating_count", 0),
+        # ソート用（ユーザーには非表示）。任天堂タイトルは批評家スコアが少ないため
+        # ユーザー評価数(rating_count) と フォロワー数(follows) も合算する
+        "_popularity":         (
+            (g.get("aggregated_rating_count") or 0)
+            + (g.get("rating_count") or 0)
+            + (g.get("follows") or 0)
+        ),
         "review":              "",
     }
 
 
 _GAMES_FIELDS = (
     "fields id, name, cover.image_id, screenshots.image_id, "
-    "aggregated_rating, aggregated_rating_count; "
+    "aggregated_rating, aggregated_rating_count, rating_count, follows; "
 )
 
 
@@ -622,8 +627,8 @@ def search_igdb(query: str) -> list[dict]:
         except Exception:
             pass
 
-        # 2b. alternative_names 部分一致 → game ID を取得
-        alt_body = f'fields game; where name ~ *"{query}"*; limit 50;'
+        # 2b. alternative_names 部分一致 → game ID を取得（大量に取って後でプラットフォーム絞り込み）
+        alt_body = f'fields game; where name ~ *"{query}"*; limit 200;'
         alt_ids: list[int] = []
         try:
             alt_resp = requests.post(
@@ -633,22 +638,24 @@ def search_igdb(query: str) -> list[dict]:
                 timeout=10,
             )
             alt_resp.raise_for_status()
-            alt_ids = [
-                item["game"]
-                for item in alt_resp.json()
-                if "game" in item and item["game"] not in results
-            ]
+            seen: set[int] = set(results.keys())
+            for item in alt_resp.json():
+                gid = item.get("game")
+                if gid and gid not in seen:
+                    alt_ids.append(gid)
+                    seen.add(gid)
         except Exception:
             pass
 
         if alt_ids:
-            # まだ未取得の ID のみ、20件まで一括取得
-            ids_str = "(" + ",".join(str(i) for i in alt_ids[:20]) + ")"
+            # 最大 50 ID を一括クエリ。platform フィルターで Switch 以外を除外するため
+            # 多めに渡して絞り込む。limit 20 で上位を取得。
+            ids_str = "(" + ",".join(str(i) for i in alt_ids[:50]) + ")"
             games_body = (
                 _GAMES_FIELDS
                 + f"where id = {ids_str} & platforms = {platform_str}; "
-                + "sort aggregated_rating_count desc; "
-                + "limit 10;"
+                + "sort follows desc; "
+                + "limit 20;"
             )
             try:
                 games_resp = requests.post(
@@ -664,10 +671,11 @@ def search_igdb(query: str) -> list[dict]:
             except Exception:
                 pass
 
-    # aggregated_rating_count 降順でソート（Arcade Archives 等を下位に押し下げ）
+    # 人気度（rating_count + aggregated_rating_count + follows の合算）降順でソート
+    # → Arcade Archives 等の無名タイトルが下位に押し下げられる
     sorted_results = sorted(
         results.values(),
-        key=lambda x: x.get("_rating_count") or 0,
+        key=lambda x: x.get("_popularity") or 0,
         reverse=True,
     )
     return sorted_results[:10]
